@@ -37,6 +37,20 @@ const TIER_RARITY: Record<string, string> = {
   T5: "Legendary", T6: "Mythic", TS: "Shadow", TZ: "Void",
 };
 
+// ---------------------------------------------------------------
+// Fallback IDs — declared first so initialLoad() can safely use them
+// ---------------------------------------------------------------
+const FALLBACK_IDS = [
+  "5d1e825ba5f79d12c938c108","5d1e825ba5f79d12c938c109",
+  "5d1e825ba5f79d12c938c10b","5d1e825ba5f79d12c938c10c",
+  "5d1e825ba5f79d12c938c10d","5d1e825ba5f79d12c938c10e",
+  "5d1e825ba5f79d12c938c10f","5d1e825ba5f79d12c938c110",
+  "5d1e825ba5f79d12c938c111","5d1e825ba5f79d12c938c112",
+  "5d1e825ba5f79d12c938c113","5d1e825ba5f79d12c938c115",
+  "5d1e825ba5f79d12c938c116","5d1e825ba5f79d12c938c117",
+  "5d1e825ba5f79d12c938c118",
+];
+
 // --- State ---
 let allCardIds: string[] = [];
 let knownIdSet = new Set<string>();          // tracks known IDs across polls
@@ -313,19 +327,5 @@ router.get("/:id", async (req: Request, res: Response) => {
   if (!card) { res.status(404).json({ error: "Card not found" }); return; }
   res.json(card);
 });
-
-// ---------------------------------------------------------------
-// Fallback IDs
-// ---------------------------------------------------------------
-const FALLBACK_IDS = [
-  "5d1e825ba5f79d12c938c108","5d1e825ba5f79d12c938c109",
-  "5d1e825ba5f79d12c938c10b","5d1e825ba5f79d12c938c10c",
-  "5d1e825ba5f79d12c938c10d","5d1e825ba5f79d12c938c10e",
-  "5d1e825ba5f79d12c938c10f","5d1e825ba5f79d12c938c110",
-  "5d1e825ba5f79d12c938c111","5d1e825ba5f79d12c938c112",
-  "5d1e825ba5f79d12c938c113","5d1e825ba5f79d12c938c115",
-  "5d1e825ba5f79d12c938c116","5d1e825ba5f79d12c938c117",
-  "5d1e825ba5f79d12c938c118",
-];
 
 export { router as cardsRouter };
