@@ -138,11 +138,12 @@ async function resolveBatch(ids: string[]): Promise<ShoobCard[]> {
 }
 
 // ---------------------------------------------------------------
-// Sitemap fetcher — returns parsed IDs
+// Sitemap fetcher — loops all pages (cards.1.xml, cards.2.xml, …)
 // ---------------------------------------------------------------
-async function fetchSitemapIds(): Promise<string[]> {
+async function fetchSitemapPage(page: number): Promise<string[]> {
   try {
-    const { data } = await axios.get(SITEMAP_URL, { timeout: 20000, headers: HEADERS });
+    const url = `https://shoob.gg/sitemap/cards.${page}.xml`;
+    const { data } = await axios.get(url, { timeout: 20000, headers: HEADERS });
     const ids: string[] = [];
     const re = /cards\/info\/([a-f0-9]{24})/g;
     let m: RegExpExecArray | null;
@@ -151,6 +152,19 @@ async function fetchSitemapIds(): Promise<string[]> {
   } catch {
     return [];
   }
+}
+
+async function fetchSitemapIds(): Promise<string[]> {
+  const allIds: string[] = [];
+  let page = 1;
+  while (true) {
+    const ids = await fetchSitemapPage(page);
+    if (ids.length === 0) break; // no more pages
+    for (const id of ids) allIds.push(id);
+    page++;
+    if (page > 50) break; // safety cap
+  }
+  return allIds;
 }
 
 // ---------------------------------------------------------------
