@@ -6,10 +6,11 @@ import * as path from "path";
 
 const router = Router();
 
-const SITEMAP_URL = "https://shoob.gg/sitemap/cards.1.xml";
+const SITEMAP_INDEX_URL = "https://shoob.gg/sitemap.xml";
 const CARDR_BASE = "https://api.shoob.gg/site/api/cardr/";
+const CARD_IMG_BASE = "https://api.shoob.gg/site/api/card/";
 const CACHE_FILE = path.join(process.cwd(), "shoob-index.json");
-const SITEMAP_POLL_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+const SITEMAP_POLL_INTERVAL_MS = 60 * 60 * 1000;
 
 const HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -26,9 +27,10 @@ interface ShoobCard {
   imageUrl: string;
   thumbnailUrl: string;
   totalIssues: number;
+  enriched?: boolean;
 }
 
-const TIER_NAMES: Record<string, string> = {
+const TIER_NUM_TO_CODE: Record<string, string> = {
   "1": "T1", "2": "T2", "3": "T3", "4": "T4",
   "5": "T5", "6": "T6", "7": "TS", "8": "TZ",
 };
@@ -38,7 +40,7 @@ const TIER_RARITY: Record<string, string> = {
 };
 
 // ---------------------------------------------------------------
-// Fallback IDs — declared first so initialLoad() can safely use them
+// Fallback IDs
 // ---------------------------------------------------------------
 const FALLBACK_IDS = [
   "5d1e825ba5f79d12c938c108","5d1e825ba5f79d12c938c109",
@@ -53,8 +55,8 @@ const FALLBACK_IDS = [
 
 // --- State ---
 let allCardIds: string[] = [];
-let knownIdSet = new Set<string>();          // tracks known IDs across polls
-let cardIndex = new Map<string, ShoobCard>(); // id → card (full index)
+let knownIdSet = new Set<string>();
+let cardIndex = new Map<string, ShoobCard>();
 let indexedCount = 0;
 let isIndexing = false;
 let sitemapLoaded = false;
@@ -82,29 +84,51 @@ function loadIndex() {
 }
 
 // ---------------------------------------------------------------
-// CDN filename parser  →  ShoobCard
+// CDN URL parser → ShoobCard
+//
+// Shoob CDN URLs come in several formats:
+//   Readable : .../cards/4/Kakashi_Hatake;4;Naruto,suffix.png  → name+series+tier
+//   Timestamp: .../cards/2/1591047632750.png                   → tier only
+//   Hash MD5 : .../cards/3/60a76e48ab2c89dd1d6348afb2df7775.png → tier only
+//   Hash SHA : .../cards/1/6525dc8b...64chars.png               → tier only
+//   EventCard: .../eventcards/2/1572422926224.png               → tier only
+//
+// Tier is ALWAYS in the path segment before the filename.
 // ---------------------------------------------------------------
-function parseFilename(cdnUrl: string, cardId: string): ShoobCard {
-  const filename = decodeURIComponent(cdnUrl.split("/").pop()?.replace(/\.png$/i, "") ?? "");
-  const match = filename.match(/^(.+?);(\d+);(.+?),(.+)$/);
-  if (match) {
-    const [, rawName, tierNum, rawSeries] = match;
-    const name = rawName.replace(/_/g, " ");
-    const series = rawSeries.replace(/_/g, " ");
-    const tier = TIER_NAMES[tierNum] ?? "T1";
+function parseCdnUrl(cdnUrl: string, cardId: string): ShoobCard {
+  const imageUrl = CARD_IMG_BASE + cardId;
+
+  // Extract tier from URL path segment: /images/cards/{tier}/ or /images/eventcards/{tier}/
+  const tierMatch = cdnUrl.match(/\/(?:event)?cards\/(\d+)\//);
+  const tierNum = tierMatch?.[1] ?? "1";
+  const tier = TIER_NUM_TO_CODE[tierNum] ?? "T1";
+  const rarity = TIER_RARITY[tier] ?? "Common";
+
+  // Try to parse readable filename: Name;TierNum;Series,Extra
+  const filename = decodeURIComponent(cdnUrl.split("/").pop()?.replace(/\.[^.]+$/i, "") ?? "");
+  const readableMatch = filename.match(/^(.+?);(\d+);(.+?)(?:,.*)?$/);
+  if (readableMatch) {
+    const name = readableMatch[1].replace(/_/g, " ").trim();
+    const series = readableMatch[3].replace(/_/g, " ").trim();
+    const fileTier = TIER_NUM_TO_CODE[readableMatch[2]] ?? tier;
     return {
-      id: cardId, name, series, tier,
-      rarity: TIER_RARITY[tier] ?? "Common",
-      imageUrl: cdnUrl, thumbnailUrl: cdnUrl,
+      id: cardId, name, series,
+      tier: fileTier, rarity: TIER_RARITY[fileTier] ?? rarity,
+      imageUrl, thumbnailUrl: imageUrl,
       totalIssues: Math.max(1, Math.ceil(Math.random() * 50)),
+      enriched: false,
     };
   }
+
+  // Fallback: tier is known, name/series are unknown
+  const shortId = cardId.slice(-6);
   return {
     id: cardId,
-    name: `Card #${cardId.slice(-6)}`,
-    series: "Unknown Series",
-    tier: "T1", rarity: "Common",
-    imageUrl: cdnUrl, thumbnailUrl: cdnUrl, totalIssues: 1,
+    name: `${tier} Card #${shortId}`,
+    series: "Unknown",
+    tier, rarity, imageUrl, thumbnailUrl: imageUrl,
+    totalIssues: 1,
+    enriched: false,
   };
 }
 
@@ -115,7 +139,7 @@ function fetchLocation(id: string): Promise<string> {
   return new Promise((resolve) => {
     const req = https.get(
       `${CARDR_BASE}${id}`,
-      { headers: HEADERS, timeout: 6000 },
+      { headers: HEADERS, timeout: 8000 },
       (res) => { resolve(res.headers.location ?? ""); res.destroy(); }
     );
     req.on("error", () => resolve(""));
@@ -124,11 +148,28 @@ function fetchLocation(id: string): Promise<string> {
 }
 
 async function resolveCard(id: string): Promise<ShoobCard | null> {
-  if (cardIndex.has(id)) return cardIndex.get(id)!;
+  // Prefer enriched data in index
+  const cached = cardIndex.get(id);
+  if (cached?.enriched) return cached;
+  if (cached) return cached;
+
   const location = await fetchLocation(id);
-  if (!location) return null;
-  const card = parseFilename(location, id);
+  if (!location) {
+    // Can't resolve via cardr — make a minimal card with just the image URL
+    const fallback: ShoobCard = {
+      id, name: `Card #${id.slice(-6)}`, series: "Unknown",
+      tier: "T1", rarity: "Common",
+      imageUrl: CARD_IMG_BASE + id,
+      thumbnailUrl: CARD_IMG_BASE + id,
+      totalIssues: 1, enriched: false,
+    };
+    cardIndex.set(id, fallback);
+    indexedCount++;
+    return fallback;
+  }
+  const card = parseCdnUrl(location, id);
   cardIndex.set(id, card);
+  indexedCount++;
   return card;
 }
 
@@ -138,55 +179,102 @@ async function resolveBatch(ids: string[]): Promise<ShoobCard[]> {
 }
 
 // ---------------------------------------------------------------
-// Sitemap fetcher — loops all pages (cards.1.xml, cards.2.xml, …)
+// Sitemap helpers
 // ---------------------------------------------------------------
-async function fetchSitemapPage(page: number): Promise<string[]> {
+function extractIdsFromXml(xml: string): string[] {
+  const ids: string[] = [];
+  // Regular cards: /cards/info/{id}
+  const reCard = /cards\/info\/([a-f0-9]{24})/g;
+  // Event cards: /card-events/{event}/{id}
+  const reEvent = /card-events\/[^/]+\/([a-f0-9]{24})/g;
+  let m: RegExpExecArray | null;
+  while ((m = reCard.exec(xml)) !== null) ids.push(m[1]);
+  while ((m = reEvent.exec(xml)) !== null) ids.push(m[1]);
+  return ids;
+}
+
+async function fetchOneSitemapUrl(url: string): Promise<string[]> {
   try {
-    const url = `https://shoob.gg/sitemap/cards.${page}.xml`;
-    const { data } = await axios.get(url, { timeout: 20000, headers: HEADERS });
-    const ids: string[] = [];
-    const re = /cards\/info\/([a-f0-9]{24})/g;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(data)) !== null) ids.push(m[1]);
-    return ids;
+    const { data } = await axios.get(url, { timeout: 25000, headers: HEADERS });
+    return extractIdsFromXml(data as string);
   } catch {
     return [];
   }
 }
 
+// ---------------------------------------------------------------
+// fetchSitemapIds — reads the sitemap index and fetches all
+// card + event_card sitemaps found there
+// ---------------------------------------------------------------
 async function fetchSitemapIds(): Promise<string[]> {
-  const allIds: string[] = [];
-  let page = 1;
-  while (true) {
-    const ids = await fetchSitemapPage(page);
-    if (ids.length === 0) break; // no more pages
-    for (const id of ids) allIds.push(id);
-    page++;
-    if (page > 50) break; // safety cap
+  const sitemapUrls: string[] = [];
+  try {
+    const { data: indexXml } = await axios.get(SITEMAP_INDEX_URL, { timeout: 20000, headers: HEADERS });
+    // Match both cards and event_cards sitemaps
+    const urlRe = /https:\/\/shoob\.gg\/sitemap\/(?:cards|event_cards)\.[^<"\s]+\.xml/g;
+    let m: RegExpExecArray | null;
+    while ((m = urlRe.exec(indexXml as string)) !== null) {
+      if (!sitemapUrls.includes(m[0])) sitemapUrls.push(m[0]);
+    }
+  } catch { /* fall through */ }
+
+  // If index gave us nothing, try known files directly
+  if (sitemapUrls.length === 0) {
+    sitemapUrls.push(
+      "https://shoob.gg/sitemap/cards.1.xml",
+      "https://shoob.gg/sitemap/event_cards.1.xml"
+    );
   }
+
+  // Fetch all sitemap pages in parallel
+  const allIds: string[] = [];
+  const seen = new Set<string>();
+  const BATCH = 5;
+  for (let i = 0; i < sitemapUrls.length; i += BATCH) {
+    const batch = sitemapUrls.slice(i, i + BATCH);
+    const results = await Promise.all(batch.map(fetchOneSitemapUrl));
+    for (const ids of results) {
+      for (const id of ids) {
+        if (!seen.has(id)) { seen.add(id); allIds.push(id); }
+      }
+    }
+  }
+
   return allIds;
 }
 
 // ---------------------------------------------------------------
-// Background full-index (50 concurrent, saves every 1000 cards)
+// Background full-index (120 concurrent)
 // ---------------------------------------------------------------
 async function indexIds(ids: string[]) {
   if (isIndexing) return;
   isIndexing = true;
 
-  const unindexed = ids.filter((id) => !cardIndex.has(id));
-  const CONCURRENCY = 50;
+  const unindexed = ids.filter((id) => !cardIndex.has(id) || !cardIndex.get(id)!.enriched);
+  const CONCURRENCY = 120;
 
   for (let i = 0; i < unindexed.length; i += CONCURRENCY) {
     const batch = unindexed.slice(i, i + CONCURRENCY);
     await Promise.all(batch.map(async (id) => {
+      if (cardIndex.get(id)?.enriched) return;
       const loc = await fetchLocation(id);
       if (loc) {
-        cardIndex.set(id, parseFilename(loc, id));
+        if (!cardIndex.get(id)?.enriched) {
+          cardIndex.set(id, parseCdnUrl(loc, id));
+          indexedCount++;
+        }
+      } else if (!cardIndex.has(id)) {
+        cardIndex.set(id, {
+          id, name: `Card #${id.slice(-6)}`, series: "Unknown",
+          tier: "T1", rarity: "Common",
+          imageUrl: CARD_IMG_BASE + id,
+          thumbnailUrl: CARD_IMG_BASE + id,
+          totalIssues: 1, enriched: false,
+        });
         indexedCount++;
       }
     }));
-    if (indexedCount % 1000 < CONCURRENCY) saveIndex();
+    if (i % (CONCURRENCY * 5) === 0) saveIndex();
   }
 
   saveIndex();
@@ -194,19 +282,17 @@ async function indexIds(ids: string[]) {
 }
 
 // ---------------------------------------------------------------
-// Sitemap poll — detects new cards added since last fetch
+// Sitemap poll — detects new cards
 // ---------------------------------------------------------------
 async function pollSitemap() {
   const freshIds = await fetchSitemapIds();
   if (!freshIds.length) return;
 
   const brandNewIds = freshIds.filter((id) => !knownIdSet.has(id));
-
   if (brandNewIds.length > 0) {
     newCardsSinceLastPoll += brandNewIds.length;
     for (const id of brandNewIds) knownIdSet.add(id);
     allCardIds = [...allCardIds, ...brandNewIds];
-    // Index new cards immediately in the background
     indexIds(brandNewIds).catch(() => { /* silent */ });
   }
 
@@ -214,7 +300,7 @@ async function pollSitemap() {
 }
 
 // ---------------------------------------------------------------
-// Initial load + periodic poll scheduler
+// Initial load
 // ---------------------------------------------------------------
 async function initialLoad() {
   loadIndex();
@@ -226,16 +312,17 @@ async function initialLoad() {
   sitemapLoaded = true;
   lastPollTime = new Date();
 
-  // Prewarm first 60 if not already cached
-  const toWarm = allCardIds.slice(0, 60).filter((id) => !cardIndex.has(id));
-  for (let i = 0; i < toWarm.length; i += 15) {
-    await resolveBatch(toWarm.slice(i, i + 15));
+  // Prewarm first 200 if not already cached (with enriched cards prioritized)
+  const toWarm = allCardIds
+    .filter((id) => !cardIndex.has(id))
+    .slice(0, 200);
+  for (let i = 0; i < toWarm.length; i += 40) {
+    await resolveBatch(toWarm.slice(i, i + 40));
   }
 
   // Full background index
   indexIds(allCardIds).catch(() => { /* silent */ });
 
-  // Poll for new cards every hour
   setInterval(() => {
     pollSitemap().catch(() => { /* silent */ });
   }, SITEMAP_POLL_INTERVAL_MS);
@@ -244,18 +331,26 @@ async function initialLoad() {
 initialLoad().catch(() => { /* silent */ });
 
 // ---------------------------------------------------------------
-// Search helper
+// Search — searches enriched cards first, then CDN-parsed names
 // ---------------------------------------------------------------
-function searchIndex(query: string, tier: string): ShoobCard[] {
+async function searchCards(query: string, tier: string): Promise<ShoobCard[]> {
   const q = query.toLowerCase();
-  const results: ShoobCard[] = [];
+  const fromIndex: ShoobCard[] = [];
+
   for (const card of cardIndex.values()) {
     if (q && !card.name.toLowerCase().includes(q) && !card.series.toLowerCase().includes(q)) continue;
     if (tier && tier !== "All" && card.tier !== tier) continue;
-    results.push(card);
+    fromIndex.push(card);
   }
-  results.sort((a, b) => a.name.localeCompare(b.name));
-  return results;
+
+  fromIndex.sort((a, b) => {
+    // Enriched cards first, then alphabetically
+    if (a.enriched && !b.enriched) return -1;
+    if (!a.enriched && b.enriched) return 1;
+    return a.name.localeCompare(b.name);
+  });
+
+  return fromIndex;
 }
 
 // ---------------------------------------------------------------
@@ -268,7 +363,7 @@ router.get("/", async (req: Request, res: Response) => {
   const limit  = 15;
 
   if (search || (tier && tier !== "All")) {
-    const matches = searchIndex(search, tier);
+    const matches = await searchCards(search, tier);
     const total = matches.length;
     return res.json({
       cards: matches.slice((page - 1) * limit, page * limit),
@@ -279,7 +374,7 @@ router.get("/", async (req: Request, res: Response) => {
     });
   }
 
-  const total      = allCardIds.length || 35678;
+  const total      = allCardIds.length || 41812;
   const totalPages = Math.ceil(total / limit);
   const sliceIds   = allCardIds.slice((page - 1) * limit, page * limit);
   const cards      = await resolveBatch(sliceIds);
@@ -287,10 +382,92 @@ router.get("/", async (req: Request, res: Response) => {
   res.json({ cards, total, page, totalPages, indexedCount, indexing: isIndexing });
 });
 
+// ---------------------------------------------------------------
+// POST /enrich — bot registers card metadata when it sees a drop
+// Body: { id, name, series, tier, imageUrl? }
+// ---------------------------------------------------------------
+router.post("/enrich", (req: Request, res: Response) => {
+  const { id, name, series, tier, imageUrl } = req.body as {
+    id?: string; name?: string; series?: string; tier?: string; imageUrl?: string;
+  };
+
+  if (!id || typeof id !== "string" || !/^[a-f0-9]{24}$/.test(id)) {
+    res.status(400).json({ error: "id must be a 24-char hex string" });
+    return;
+  }
+  if (!name || !series || !tier) {
+    res.status(400).json({ error: "name, series and tier are required" });
+    return;
+  }
+  if (!TIER_RARITY[tier]) {
+    res.status(400).json({ error: `tier must be one of: ${Object.keys(TIER_RARITY).join(", ")}` });
+    return;
+  }
+
+  const img = imageUrl || CARD_IMG_BASE + id;
+  const card: ShoobCard = {
+    id, name: name.trim(), series: series.trim(), tier,
+    rarity: TIER_RARITY[tier],
+    imageUrl: img, thumbnailUrl: img,
+    totalIssues: cardIndex.get(id)?.totalIssues ?? 1,
+    enriched: true,
+  };
+
+  cardIndex.set(id, card);
+  if (!knownIdSet.has(id)) {
+    knownIdSet.add(id);
+    allCardIds.push(id);
+  }
+  indexedCount = cardIndex.size;
+
+  setImmediate(() => saveIndex());
+
+  res.json({ ok: true, card });
+});
+
+// ---------------------------------------------------------------
+// POST /enrich/bulk — batch enrichment (up to 500 cards)
+// Body: [{ id, name, series, tier, imageUrl? }, ...]
+// ---------------------------------------------------------------
+router.post("/enrich/bulk", (req: Request, res: Response) => {
+  const items = req.body as Array<{ id?: string; name?: string; series?: string; tier?: string; imageUrl?: string }>;
+  if (!Array.isArray(items)) {
+    res.status(400).json({ error: "Body must be an array" });
+    return;
+  }
+
+  let saved = 0;
+  const errors: string[] = [];
+
+  for (const item of items.slice(0, 500)) {
+    const { id, name, series, tier, imageUrl } = item;
+    if (!id || !/^[a-f0-9]{24}$/.test(id) || !name || !series || !tier || !TIER_RARITY[tier]) {
+      errors.push(id ?? "?");
+      continue;
+    }
+    const img = imageUrl || CARD_IMG_BASE + id;
+    cardIndex.set(id, {
+      id, name: name.trim(), series: series.trim(), tier,
+      rarity: TIER_RARITY[tier], imageUrl: img, thumbnailUrl: img,
+      totalIssues: cardIndex.get(id)?.totalIssues ?? 1, enriched: true,
+    });
+    if (!knownIdSet.has(id)) { knownIdSet.add(id); allCardIds.push(id); }
+    saved++;
+  }
+
+  indexedCount = cardIndex.size;
+  setImmediate(() => saveIndex());
+  res.json({ ok: true, saved, errors: errors.length, failed: errors });
+});
+
 router.get("/stats", async (_req: Request, res: Response) => {
   const byTier: Record<string, number> = { T1: 0, T2: 0, T3: 0, T4: 0, T5: 0, T6: 0, TS: 0, TZ: 0 };
-  for (const c of cardIndex.values()) { if (byTier[c.tier] !== undefined) byTier[c.tier]++; }
-  res.json({ total: allCardIds.length || 35678, byTier, indexedCount, indexing: isIndexing });
+  let enrichedCount = 0;
+  for (const c of cardIndex.values()) {
+    if (byTier[c.tier] !== undefined) byTier[c.tier]++;
+    if (c.enriched) enrichedCount++;
+  }
+  res.json({ total: allCardIds.length, byTier, indexedCount, enrichedCount, indexing: isIndexing });
 });
 
 router.get("/featured", async (_req: Request, res: Response) => {
@@ -307,21 +484,19 @@ router.get("/index-status", (_req: Request, res: Response) => {
     pct: allCardIds.length ? Math.round((indexedCount / allCardIds.length) * 100) : 0,
     lastPollTime: lastPollTime?.toISOString() ?? null,
     newCardsSinceLastPoll,
+    enriched: [...cardIndex.values()].filter(c => c.enriched).length,
   });
 });
 
 router.get("/random", async (req: Request, res: Response) => {
   const tierFilter = String(req.query.tier || "").trim();
 
-  let candidates: string[];
+  let candidates: ShoobCard[];
   if (tierFilter && tierFilter !== "All") {
-    candidates = [];
-    for (const [id, card] of cardIndex.entries()) {
-      if (card.tier === tierFilter) candidates.push(id);
-    }
-    if (!candidates.length) candidates = [...cardIndex.keys()];
+    candidates = [...cardIndex.values()].filter(c => c.tier === tierFilter);
+    if (!candidates.length) candidates = [...cardIndex.values()];
   } else {
-    candidates = [...cardIndex.keys()];
+    candidates = [...cardIndex.values()];
   }
 
   if (!candidates.length) {
@@ -329,14 +504,16 @@ router.get("/random", async (req: Request, res: Response) => {
     return;
   }
 
-  const randomId = candidates[Math.floor(Math.random() * candidates.length)];
-  const card = cardIndex.get(randomId);
-  if (!card) { res.status(503).json({ error: "Index not ready" }); return; }
+  const card = candidates[Math.floor(Math.random() * candidates.length)];
   res.json(card);
 });
 
 router.get("/:id", async (req: Request, res: Response) => {
   const { id } = req.params;
+  if (!/^[a-f0-9]{24}$/.test(id)) {
+    res.status(400).json({ error: "Invalid card ID" });
+    return;
+  }
   const card = await resolveCard(id);
   if (!card) { res.status(404).json({ error: "Card not found" }); return; }
   res.json(card);
